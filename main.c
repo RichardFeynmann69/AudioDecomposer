@@ -3,6 +3,9 @@
 #include <sndfile.h>
 #include <stdint.h>
 
+#define PCM16_NORMALIZATION_FACTOR 32768.0
+
+
 /* ---- Custom functions ---- */
 void mix_to_mono(const int16_t *input, int16_t *output, long long frames, int channels)
 {
@@ -14,6 +17,12 @@ void mix_to_mono(const int16_t *input, int16_t *output, long long frames, int ch
         }
 
         output[i] = sum / channels;
+    }
+}
+
+void normalize_mono(const int16_t *input, float *output, long long frames){
+    for (long long i = 0; i < frames; i++){
+        output[i] = (float)input[i] / PCM16_NORMALIZATION_FACTOR;
     }
 }
 
@@ -68,9 +77,23 @@ int main(int argc, char *argv[])
 
     mix_to_mono(buffer, mono, frames_read, info.channels);
 
-    printf("First 10 mono samples:\n");
+
+    float *normalized_mono = malloc(info.frames * sizeof(float));
+
+
+    if (!normalized_mono) {
+    printf("Memory allocation failed.\n");
+    sf_close(file);
+    free(buffer);
+    free(mono);
+    return 1;
+    }
+
+    normalize_mono(mono, normalized_mono, frames_read);
+
+    printf("First 10 normalized mono samples:\n");
     for (int i = 0; i < 10 && i < frames_read; i++) {
-        printf("%d\n", mono[i]);
+        printf("%f\n", normalized_mono[i]);
     }
 
 
@@ -88,5 +111,6 @@ int main(int argc, char *argv[])
     sf_close(file);
     free(buffer);
     free(mono);
+    free(normalized_mono);
     return 0;
 }
