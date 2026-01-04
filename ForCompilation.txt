@@ -2,7 +2,7 @@ prepare file:
 ffmpeg -i test.wav -acodec pcm_s16le output.wav
 
 compile:
-gcc main.c -lsndfile -o audio_info
+gcc main.c -lsndfile -lm -o audio_info
 
 run:
 ./audio_info audio/output.wav
