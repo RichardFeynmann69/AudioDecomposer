@@ -3,9 +3,12 @@
 #include <sndfile.h>
 #include <stdint.h>
 #include <math.h>
+#include <fftw3.h>
+
 
 #define PCM16_NORMALIZATION_FACTOR 32768.0
 #define WINDOW_DURATION 0.09 //90 miliseconds 
+#define MAGNITUDE_THRESHOLD 0.01  // keep bins >1% of max magnitude in the window
 
 
 /* ---- Custom functions ---- */
@@ -58,6 +61,95 @@ void fill_windows(const float *normalized_mono, float *windows, const float *han
         }
     }
 }
+
+
+void reconstruct_harmonics_to_wav(fftw_complex **spectra,int window_length,int hop_size,int window_quantity,
+        int bins_per_window,  int sample_rate, long long total_samples)
+{
+    // Precompute max magnitude per bin across all windows
+    double *max_magnitude_per_bin = calloc(bins_per_window, sizeof(double));
+    for (int bin = 0; bin < bins_per_window; bin++) {
+        for (int k = 0; k < window_quantity; k++) {
+            double mag = sqrt(spectra[k][bin][0]*spectra[k][bin][0] +
+                              spectra[k][bin][1]*spectra[k][bin][1]);
+            if (mag > max_magnitude_per_bin[bin])
+                max_magnitude_per_bin[bin] = mag;
+        }
+    }
+
+    // Loop over each harmonic/frequency bin
+    for (int bin = 0; bin < bins_per_window; bin++) {
+
+        // Skip bins below threshold
+        if (max_magnitude_per_bin[bin] < MAGNITUDE_THRESHOLD)
+            continue;
+
+        // Allocate output buffer for this harmonic
+        float *harmonic_signal = calloc(total_samples, sizeof(float));
+        if (!harmonic_signal) {
+            fprintf(stderr, "Memory allocation failed for harmonic %d\n", bin);
+            continue;
+        }
+
+        // Reconstruct the signal window by window
+        for (int k = 0; k < window_quantity; k++) {
+            double amplitude = sqrt(spectra[k][bin][0]*spectra[k][bin][0] +
+                                    spectra[k][bin][1]*spectra[k][bin][1]);
+            double phase = atan2(spectra[k][bin][1], spectra[k][bin][0]);
+
+            for (int n = 0; n < window_length; n++) {
+                int pos = k * hop_size + n;
+                if (pos >= total_samples) break;
+
+                harmonic_signal[pos] += (float)(amplitude * sin(2.0 * M_PI * bin * n / window_length + phase));
+            }
+        }
+
+        // Normalize the harmonic signal to avoid clipping
+        float max_val = 0.0f;
+        for (long long i = 0; i < total_samples; i++) {
+            if (fabs(harmonic_signal[i]) > max_val) max_val = fabs(harmonic_signal[i]);
+        }
+        if (max_val > 0.0f) {
+            for (long long i = 0; i < total_samples; i++) {
+                harmonic_signal[i] /= max_val;
+            }
+        }
+
+        // Prepare WAV file info
+        SF_INFO sfinfo;
+        sfinfo.samplerate = sample_rate;
+        sfinfo.channels = 1;
+        sfinfo.format = SF_FORMAT_WAV | SF_FORMAT_PCM_16;
+
+        char filename[64];
+        snprintf(filename, sizeof(filename), "./audio/deconstructed/harmonic_%d.wav", bin);
+
+        SNDFILE *out_file = sf_open(filename, SFM_WRITE, &sfinfo);
+        if (!out_file) {
+            fprintf(stderr, "Error opening output file %s: %s\n", filename, sf_strerror(NULL));
+            free(harmonic_signal);
+            continue;
+        }
+
+        // Convert float [-1,1] to PCM16 and write
+        int16_t *pcm_buffer = malloc(sizeof(int16_t) * total_samples);
+        for (long long i = 0; i < total_samples; i++) {
+            pcm_buffer[i] = (int16_t)(harmonic_signal[i] * 32767.0f);
+        }
+
+        sf_writef_short(out_file, pcm_buffer, total_samples);
+        sf_close(out_file);
+
+        free(pcm_buffer);
+        free(harmonic_signal);
+    }
+
+    free(max_magnitude_per_bin);
+
+    printf("Significant harmonics written to WAV files.\n");
+}
+
 
 
 int main(int argc, char *argv[])
@@ -125,7 +217,7 @@ int main(int argc, char *argv[])
     normalize_mono(mono, normalized_mono, frames_read);
 
     int window_length = round(info.samplerate * WINDOW_DURATION);
-    int hop_size = window_length / 2;
+    int hop_size = window_length / 4;
 
     int window_quantity = compute_quantity_of_windows(frames_read, window_length, hop_size);
 
@@ -149,18 +241,46 @@ int main(int argc, char *argv[])
     hann_function(hann_array, window_length);
     fill_windows(normalized_mono, windows, hann_array, window_length, hop_size, window_quantity);
 
-    printf("\nFirst 10 windows (first 10 samples each):\n");
+    
+    int bins_per_window = window_length / 2 + 1;
 
-int max_windows_to_print = window_quantity < 10 ? window_quantity : 10;
-int max_samples_to_print = window_length < 10 ? window_length : 10;
-
-for (int k = 0; k < max_windows_to_print; k++) {
-    printf("Window %d: ", k);
-    for (int n = 0; n < max_samples_to_print; n++) {
-        printf("%f ", windows[k * window_length + n]);
+    fftw_complex **spectra = malloc(sizeof(fftw_complex*) * window_quantity);
+    if (!spectra) {
+        printf("Memory allocation failed for spectra.\n");
+        return 1;
     }
-    printf("\n");
-}
+    for (int k = 0; k < window_quantity; k++) {
+        spectra[k] = malloc(sizeof(fftw_complex) * bins_per_window);
+        if (!spectra[k]) {
+            printf("Memory allocation failed for spectra[%d].\n", k);
+            return 1;
+        }
+    }
+
+    double *fft_in = fftw_malloc(sizeof(double) * window_length);
+    fftw_complex *fft_out = fftw_malloc(sizeof(fftw_complex) * bins_per_window);
+
+    fftw_plan plan = fftw_plan_dft_r2c_1d(window_length, fft_in, fft_out, FFTW_MEASURE);
+
+    for (int k = 0; k < window_quantity; k++) {
+
+        float *current_window = &windows[k * window_length];
+
+        for (int n = 0; n < window_length; n++) {
+            fft_in[n] = (double)current_window[n];
+        }
+
+        fftw_execute(plan);
+
+        for (int bin = 0; bin < bins_per_window; bin++) {
+            spectra[k][bin][0] = fft_out[bin][0]; // real
+            spectra[k][bin][1] = fft_out[bin][1]; // imag
+        }
+    }
+
+    // spectra[k][bin] now contains all FFT results
+
+    reconstruct_harmonics_to_wav(spectra,window_length,hop_size,window_quantity,bins_per_window,info.samplerate,frames_read);
 
 
 
@@ -181,5 +301,12 @@ for (int k = 0; k < max_windows_to_print; k++) {
     free(normalized_mono);
     free(windows);
     free(hann_array);
+    fftw_destroy_plan(plan);
+    fftw_free(fft_in);
+    fftw_free(fft_out);
+    for (int k = 0; k < window_quantity; k++) {
+        free(spectra[k]);
+    }
+    free(spectra);
     return 0;
 }

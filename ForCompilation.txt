@@ -1,8 +1,12 @@
 prepare file:
+//cut file to 30 seconds
+ffmpeg -i input.wav -ss 00:00:00 -t 00:00:30 test.wav
+
+//prepare for program
 ffmpeg -i test.wav -acodec pcm_s16le output.wav
 
 compile:
-gcc main.c -lsndfile -lm -o audio_info
+gcc main.c -lsndfile -lfftw3 -lm -o audio_info
 
 run:
 ./audio_info audio/output.wav
